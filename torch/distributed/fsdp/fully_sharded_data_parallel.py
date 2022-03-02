@@ -1293,10 +1293,24 @@ class FullyShardedDataParallel(nn.Module):
                 # Average grad by world_size for consistency with PyTorch DDP.
                 param.grad.div_(self.gradient_predivide_factor)
 
+            grad = param.grad.data
             if param._is_sharded:  # type: ignore[attr-defined]
-                grad_flatten = torch.flatten(param.grad)
+                # We clear `param.grad` to permit repeated gradient
+                # computations when this FSDP module is called multiple times.
+                # This is to avoid a race among multiple re-entrant backward
+                # passes. For example, the second backward pass computation
+                # precedes ahead of the first backward pass reduction, which is
+                # possible since the reduction is in a different stream and is
+                # async. Then, the first backward pass may be incorrectly
+                # reducing the second backward pass's `param.grad`.
+                # The reduced gradients are accumulated in
+                # `param._saved_grad_shard`, and the gradient reductions can
+                # happen in arbitrary order, though we tolerate this due to the
+                # (approximate) commutativity of floating-point addition.
+                param.grad = None
+                grad_flatten = torch.flatten(grad)
                 chunks = list(grad_flatten.chunk(self.world_size))
-                num_pad = self.world_size * chunks[0].numel() - param.grad.numel()
+                num_pad = self.world_size * chunks[0].numel() - grad.numel()
                 input_flattened = F.pad(grad_flatten, [0, num_pad])
                 output = torch.zeros_like(chunks[0])
                 dist._reduce_scatter_base(
@@ -1305,7 +1319,28 @@ class FullyShardedDataParallel(nn.Module):
                 if self.gradient_postdivide_factor > 1:
                     # Average grad by world_size for consistency with PyTorch DDP.
                     output.div_(self.gradient_postdivide_factor)
-                param.grad.data = output
+                # To support gradient accumulation outside `no_sync()`, we save
+                # the gradient data to `param._saved_grad_shard` before the
+                # backward pass, accumulate gradients into it here, and set
+                # `param.grad` with the accumulated value at the end of the
+                # backward pass in preparation for the optimizer step.
+                accumulate_grad = hasattr(param, "_saved_grad_shard")
+                if accumulate_grad:
+                    p_assert(
+                        param._saved_grad_shard.shape == output.shape,  # type: ignore[attr-defined]
+                        "Shape mismatch when accumulating gradients: "  # type: ignore[attr-defined]
+                        f"existing shape={param._saved_grad_shard.shape} "
+                        f"new shape={output.shape}"  # type: ignore[attr-defined]
+                    )
+                    p_assert(
+                        not self.cpu_offload.offload_params,
+                        "FSDP does not support gradient accumulation outside "
+                        "`no_sync()` while using CPU offloading"
+                    )
+                    param._saved_grad_shard.data += output.data  # type: ignore[attr-defined]
+                else:
+                    param._saved_grad_shard = output  # type: ignore[attr-defined]
+                grad = param._saved_grad_shard  # type: ignore[attr-defined]
             else:
                 # Currently the only way for _is_sharded to be False is if
                 # world_size == 1. This could be relaxed in the future, e.g,
@@ -1324,14 +1359,10 @@ class FullyShardedDataParallel(nn.Module):
                 # and ensure the appropriate synchronization is done by waiting
                 # streams in _wait_for_post_backward.
                 param._cpu_grad.copy_(  # type: ignore[attr-defined]
-                    param.grad.detach(), non_blocking=True
+                    grad.detach(), non_blocking=True
                 )
                 # Don't let this memory get reused until after the transfer.
-                param.grad.data.record_stream(torch.cuda.current_stream())
-                # Point param.grad.data to CPU grad to offload it. Note that
-                # the transfer is async so it is not necessarily done until we
-                # explicitly synchronize in backward.
-                param.grad.data = param._cpu_grad  # type: ignore[attr-defined]
+                grad.data.record_stream(torch.cuda.current_stream())
 
             # After _post_backward_hook returns, orig_grad_data will eventually
             # go out of scope, at which point it could otherwise be freed for
@@ -1378,7 +1409,7 @@ class FullyShardedDataParallel(nn.Module):
 
         # A backward pass is done, clean up below.
 
-        def _remove_shard_bwd_hook(fsdp_module: FullyShardedDataParallel) -> None:
+        def _finalize_params(fsdp_module: FullyShardedDataParallel) -> None:
             """Helper used below on all fsdp modules."""
             for p in fsdp_module.params:
                 if p.requires_grad:
@@ -1390,11 +1421,41 @@ class FullyShardedDataParallel(nn.Module):
                         )
                         p._shard_bwd_hook[1].remove()  # type: ignore[attr-defined]
                         delattr(p, "_shard_bwd_hook")
+                    # Preserve the gradient accumulation state if not
+                    # synchronizing: `p.grad` remains the unsharded gradient
+                    # accumulated from prior `no_sync()` iterations, and
+                    # `p._saved_grad_shard` remains the sharded gradient from
+                    # the last synchronized iteration
+                    if not self._require_backward_grad_sync:
+                        continue
+                    # Set `p.grad` as needed to ensure optimizer correctness
+                    # since optimizers operate on the `grad` attribute
+                    if hasattr(p, "_cpu_grad"):
+                        p_assert(
+                            p.device == torch.device("cpu"),
+                            f"Device mismatch: p={p.device} "  # type: ignore[attr-defined]
+                            f"p._cpu_grad={p._cpu_grad}"
+                        )
+                        p.grad = p._cpu_grad  # type: ignore[attr-defined]
+                    elif hasattr(p, "_saved_grad_shard"):
+                        p_assert(
+                            p.device == p._saved_grad_shard.device,  # type: ignore[attr-defined]
+                            f"Device mismatch: p={p.device} "  # type: ignore[attr-defined]
+                            f"p._saved_grad_shard={p._saved_grad_shard.device}"
+                        )
+                        p.grad = p._saved_grad_shard  # type: ignore[attr-defined]
+                    else:
+                        p_assert(
+                            not p._is_sharded, "All sharded parameters should "
+                            "use `_saved_grad_shard`"
+                        )
+                    if hasattr(p, "_saved_grad_shard"):
+                        delattr(p, "_saved_grad_shard")
 
         # Update root and nested FSDP's hooks and flags.
         for m in self.modules():  # includes self
             if isinstance(m, FullyShardedDataParallel):
-                _remove_shard_bwd_hook(m)
+                _finalize_params(m)
                 m._pre_backward_hook_has_run = False
                 if any(p.requires_grad for p in m.parameters()):
                     # Check if the module has params and if any of them has
@@ -1485,6 +1546,24 @@ class FullyShardedDataParallel(nn.Module):
                 p.grad.size() != p._orig_size  # type: ignore[attr-defined]
                 or p.grad.device != p.device
             ):
+                offloaded: bool = p.grad.device != p.device
+                if offloaded:
+                    assert self.cpu_offload.offload_params, \
+                        "`p.grad.device` and `p.device` should be the same " \
+                        "if not offloading parameters to CPU"
+                outside_no_sync: bool = p.grad.size() == p._local_shard.shape  # type: ignore[attr-defined]
+                assert not outside_no_sync or \
+                    (self._is_root or self._require_backward_grad_sync), \
+                    "Each FSDP modules should require backward grad sync " \
+                    "outside `no_sync()` except the root module"
+                # FSDP currently does not support gradient accumulation outside
+                # `no_sync()` when using CPU offloading, and `no_sync()`
+                # accumulates directly in `p.grad`
+                if not offloaded and outside_no_sync:
+                    # Use `p._saved_grad_shard` as an auxiliary variable in
+                    # which to accumulate gradients, leaving `p.grad` for FSDP
+                    # to use for managing each per-iteration gradient
+                    p._saved_grad_shard = p.grad.data  # type: ignore[attr-defined]
                 p.grad = None
 
     @torch.no_grad()
@@ -1559,6 +1638,10 @@ class FullyShardedDataParallel(nn.Module):
         .. note:: This likely results in higher memory usage because FSDP will
             accumulate the full model gradients (instead of gradient shards)
             until the eventual sync.
+
+        .. note:: When used with CPU offloading, the gradients will not be
+            offloaded to CPU when inside the context manager. Instead, they
+            will only be offloaded right after the eventual sync.
         """
         self._lazy_init()
         assert self._is_root, "`no_sync()` on inner FSDP instances is not supported"
@@ -1613,3 +1696,10 @@ def _alloc_storage(data: torch.Tensor, size: torch.Size) -> None:
         data.storage().size() == 0
     ), "Then tensor storage should have been resized to be 0."
     data.storage().resize_(size.numel())  # type: ignore[attr-defined]
+
+def p_assert(cond: Any, s: Any) -> None:
+    """This is used as an alternate to ``assert`` when in the backward context
+    to print the error message ``s`` since otherwise, it is swallowed."""
+    if not cond:
+        print(s)
+        raise AssertionError
